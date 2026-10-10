@@ -140,7 +140,7 @@ let
   # top-level module names the uri `.ml` emits resolve unwrapped (the
   # dependency findlib packages wrap them into `Codec.*`/`Text.*`/…).
 
-  ocaml-lib-name = builtins.replaceStrings [ "-" ] [ "_" ] pname;
+  ocaml-lib-name = pname;
   # The uri pure module PLUS every transitive dependency pure module,
   # extracted locally (NOT consumed from the dep findlib packages, which wrap).
   ocaml-modules = (map (m: builtins.replaceStrings [ "." ] [ "_" ] m) pure-modules) ++ [

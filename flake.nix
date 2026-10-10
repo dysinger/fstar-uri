@@ -15,7 +15,7 @@
       flake = false;
     };
     # The codec dependency (Data.Codec.Types / Data.Codec).
-    fstar-codec.url = "github:dysinger/fstar-codec/cea4062";
+    fstar-codec.url = "github:dysinger/fstar-codec/5835aeb";
     # The text dependency (Data.Text.Codec — the `text_chars` string
     # combinator used for scheme/path/query runs).
     fstar-text.url = "github:dysinger/fstar-text";

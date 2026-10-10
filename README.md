@@ -16,10 +16,26 @@ single byte.
 The pure `Network.URI` re-expresses the RFC 3986 grammar over the record
 `codec a` combinators (Mandate 22: no bespoke scanners):
 
-- `scheme` = `text_chars 64 is_scheme_char`
-- `host` = `choice ipv6_host (choice ipv4_host domain_host)` (prefix-disjoint)
+- `scheme` = ALPHA-leading `text_chars` run (`custom` head guard: first char
+  must be ALPHA, so `1http` is rejected)
+- `host` = untagged `alt` chain disambiguated by leading byte (`[` → bracketed
+  IPv6 `IP-literal`, digit → IPv4, otherwise DNS `reg-name`)
 - `port` = `digits_to_int 5 (<= 65535)`
+- `authority` = `host` [`:` `port`] (the RFC 3986 §3.2.1 `userinfo` `@` prefix
+  is a deferred component — see below)
 - `path` = slash-separated segments; `query` = `&`-separated `key=value` pairs
+
+The wire format is RFC 3986 TEXT — no tag/control bytes.  Optional
+components (`//authority`, `?query`, `#fragment`, `:port`) are delimiter
+-prefixed via the `opt_prefixed` combinator (`fstar-codec` combinator 26); an
+absent component encodes to the empty sequence.  The IPv6 host is bracketed
+(`[::1]`) as RFC §3.2.2 requires.
+
+**Deferred RFC component**: RFC 3986 §3.2.1 `userinfo` (`[userinfo "@"]`)
+is not yet carried on the wire — its `@`-delimiter split is a list-level
+multi-byte lookahead (fstar-proofs §48/§50) pending a dedicated
+`opt_suffixed` primitive.  The `authority` type therefore carries only
+`host` + `port`.
 
 Each leaf (`ipv4_codec`/`ipv6_codec` from `fstar-ip`, `domain_codec` from
 `fstar-dns`, `text_chars` from `fstar-text`) carries a proven `.roundtrip`;

@@ -6,7 +6,7 @@
 | Name | Kind | Description |
 |------|------|-------------|
 | `uri_host` | sum | `IPv4Host of ipv4` \| `IPv6Host of ipv6` \| `DomainHost of domain_name` |
-| `authority` | record | `userinfo : option string`, `host : uri_host`, `port : option int` |
+| `authority` | record | `host : uri_host`, `port : option int` ([userinfo] is a deferred RFC component) |
 | `path` | alias | `list string` (path segments) |
 | `query_param` | record | `key : string`, `value : string` |
 | `query` | alias | `list query_param` |
@@ -22,11 +22,12 @@
 
 | Function | Signature | Description |
 |----------|-----------|-------------|
-| `is_scheme_char` | `char -> bool` | `ALPHA ( ALPHA \| DIGIT \| + \| - \| . )*` |
+| `is_scheme_char` | `char -> bool` | `ALPHA \| DIGIT \| + \| - \| .` (the scheme TAIL; the head is ALPHA via [scheme_codec]) |
 | `is_unreserved` | `char -> bool` | `ALPHA \| DIGIT \| - \| . \| _ \| ~` |
 | `is_sub_delim` | `char -> bool` | `! $ & ' ( ) * + , ; =` |
-| `is_pchar` | `char -> bool` | `unreserved \| sub-delims \| : \| @` (any char except `/ ? #`) |
-| `is_query_char` | `char -> bool` | any char except `= & #` |
+| `is_pchar` | `char -> bool` | `unreserved \| sub-delims \| : \| @` (POSITIVE set; excludes `%`, brackets, control bytes) |
+| `is_query_char` | `char -> bool` | `pchar \| / \| ?` (includes `=` and `&` via sub-delims) |
+| `is_userinfo_char` | `char -> bool` | `unreserved \| sub-delims \| :` (`@` excluded) |
 | `code_of` | `char -> int` | the integer code point of a character |
 
 ## Codec
@@ -41,11 +42,11 @@
 | `ipv6_host` | `codec uri_host` | the bracketed IPv6 host |
 | `ipv4_host` | `codec uri_host` | the dotted-decimal IPv4 host |
 | `domain_host` | `codec uri_host` | the DNS registered name (carries `fully_qualified`) |
-| `host_codec` | `codec uri_host` | `choice ipv6_host (choice ipv4_host domain_host)` |
+| `host_codec` | `codec uri_host` | untagged `alt` chain: `[`-bracketed IPv6, digit → IPv4, else DNS domain |
 | `port_codec` | `codec int` | the decimal port 0..65535 (`digits_to_int 5`) |
-| `userinfo_codec` | `codec string` | the `userinfo` run |
-| `authority_codec` | `codec authority` | `[userinfo @] host [: port]` |
-| `uri_codec` | `codec uri` | the whole RFC 3986 generic URI |
+| `userinfo_codec` | `codec string` | the [userinfo] run (deferred component) |
+| `authority_codec` | `codec authority` | `host [":" port]` (port via [opt_prefixed], no tag bytes) |
+| `uri_codec` | `codec uri` | `scheme ":" ["//authority] path ["?query] ["#fragment]` (optionals via [opt_prefixed]) |
 
 ## Delimiters
 

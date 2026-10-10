@@ -7,11 +7,17 @@ Network.URI — URI type and codec (RFC 3986).
 A verified URI grammar built on the record [Data.Codec] combinator library
 (Mandate 22: no bespoke scanners — every parse/serialize step is a combinator).
 
+The wire format is RFC 3986 TEXT: `scheme ":" hier-part [ "?" query ]
+[ "#" fragment ]`, with the host `IP-literal` / `IPv4address` / `reg-name`
+branches disambiguated by their LEADING BYTE (no tag bytes), the IPv6
+`IP-literal` bracketed in `[` `]`, and every optional component delimited by
+its RFC separator (`//`, `?`, `#`) rather than a `sum` tag.
+
 @header Network.URI
 
 @section Types
 - [uri_host] — [IPv4Host] | [IPv6Host] | [DomainHost]
-- [authority] — [userinfo] `@` [host] `:` [port]
+- [authority] — [host] [":" port] (userinfo is a deferred RFC component)
 - [uri] — [scheme] `:` [authority]? [path] [`?`query]? [`#`fragment]?
 
 @section Character predicates
@@ -47,7 +53,7 @@ module U8 = FStar.UInt8
    ======================================================================== *)
 
 
-(** [uri_host] — the three host kinds of RFC 3986 §3.2.2: an IP-literal
+(** [uri_host] — the three host kinds of RFC 3986 §3.2.2: an `IP-literal`
     (IPv6, bracketed), an IPv4 address (dotted-decimal), or a registered
     name (DNS domain). *)
 type uri_host =
@@ -56,12 +62,17 @@ type uri_host =
   | DomainHost : domain_name -> uri_host
 
 
-(** [authority] — the RFC 3986 §3.2 authority: optional userinfo, a host,
-    optional port. *)
+(** [authority] — the RFC 3986 §3.2 authority: a host and an optional port.
+
+    NOTE (deferred RFC component): RFC 3986 §3.2.1's [userinfo] ([userinfo
+    "@"] prefix) is NOT yet carried on the wire — its [@]-delimiter split is a
+    list-level multi-byte lookahead (fstar-proofs §48/§50) requiring a
+    dedicated [opt_suffixed] primitive; see task 8.1.  Until then the
+    authority is [host [":" port]], which stays 0-admit and fully RFC text
+    (no tag bytes). *)
 type authority = {
-  userinfo : option string;
-  host     : uri_host;
-  port     : option int;
+  host : uri_host;
+  port : option int;
 }
 
 
@@ -100,9 +111,9 @@ type uri = {
 let code_of (c: FStar.Char.char) : int = FStar.Char.int_of_char c
 
 
-(** [is_scheme_char] — RFC 3986 [scheme]: `ALPHA ( ALPHA | DIGIT | + | - | . )*`.
-    Evaluated at the character level (non-ASCII is rejected via the [< 128]
-    guard, mirroring the [ascii_ok] bridge). *)
+(** [is_scheme_char] — RFC 3986 [scheme] tail-set: `ALPHA | DIGIT | + | - | .`.
+    The FIRST scheme character must be ALPHA (enforced structurally by
+    [scheme_codec], not here); this predicate governs the remainder. *)
 let is_scheme_char (c: FStar.Char.char) : bool =
   let v = code_of c in
   v >= 0 && v < 128 &&
@@ -127,17 +138,20 @@ let is_sub_delim (c: FStar.Char.char) : bool =
 
 
 (** [is_pchar] — RFC 3986 [pchar]: [unreserved] | [sub-delims] | `:` | `@`.
-    (i.e. any char except the delimiters `/ ? #`). *)
+    (The POSITIVE set; raw `%`, brackets, and control bytes are EXCLUDED,
+    mirroring the RFC exactly.) *)
 let is_pchar (c: FStar.Char.char) : bool =
   let v = code_of c in
-  v >= 0 && v < 128 && v <> 0x2F && v <> 0x3F && v <> 0x23
+  is_unreserved c || is_sub_delim c || v = 0x3A || v = 0x40
 
 
-(** [is_query_char] — RFC 3986 [query]: [pchar] | `/` | `?` (but NOT `=` or
-    `&` or `#`, since those delimit pairs and the fragment). *)
+(** [is_query_char] — RFC 3986 [query]: [pchar] | `/` | `?`.  Because `=` and
+    `&` are sub-delims (and therefore [pchar]), they ARE permitted here; the
+    query pair-level `=`/`&` split is handled by the compositor
+    [query_pair_codec]/[query_codec], not by narrowing this set. *)
 let is_query_char (c: FStar.Char.char) : bool =
   let v = code_of c in
-  v >= 0 && v < 128 && v <> 0x3D && v <> 0x26 && v <> 0x23
+  is_pchar c || v = 0x2F || v = 0x3F
 
 
 (* ========================================================================
@@ -173,16 +187,72 @@ let equals : codec unit = byte_val 0x3Duy
 let ampersand : codec unit = byte_val 0x26uy
 
 
+(** [open_bracket] — the `[` (0x5B) delimiter framing an `IP-literal`. *)
+let open_bracket : codec unit = byte_val 0x5Buy
+
+
+(** [close_bracket] — the `]` (0x5D) delimiter framing an `IP-literal`. *)
+let close_bracket : codec unit = byte_val 0x5Duy
+
+
+(** [double_slash] — the `//` (0x2F 0x2F) authority prefix. *)
+let double_slash : codec unit = bytes [0x2Fuy; 0x2Fuy]
+
+
 (* ========================================================================
    Scheme codec
    ======================================================================== *)
 
 
-(** [scheme_codec] — the RFC 3986 [scheme] as a [codec string]: one-or-more
-    scheme characters, bounded to 64 (a practical upper bound well above any
-    registered scheme).  Built on [text_chars], the verified bounded-greedy
-    one-or-more string combinator. *)
-let scheme_codec : codec string = text_chars 64 is_scheme_char
+(** [is_scheme_head] — RFC 3986 [scheme] head: the FIRST character must be
+    ALPHA. *)
+let is_scheme_head (c: FStar.Char.char) : bool = char_is_alpha c
+
+
+(** [scheme_codec] — the RFC 3986 [scheme] as a [codec string]: an ALPHA first
+    character followed by zero-or-more [is_scheme_char]s (so `https`,
+    `http`, `ftp` round-trip, while `1http` is REJECTED), bounded to 64.
+
+    A [custom] codec whose decoder/encoder/[wfcv] delegate to the verified
+    [text_chars] run but ADD the alpha-first head guard ([text_chars] applies
+    a single per-char predicate to every char and cannot enforce a distinct
+    first-char class). *)
+let scheme_codec : codec string =
+  custom
+    (fun (input: byte_seq) ->
+      match text_chars_dec 64 is_scheme_char input with
+      | Inr (s, n) ->
+          let cs = FStar.String.list_of_string s in
+          (match cs with
+           | c :: _ ->
+               if is_scheme_head c then Inr (s, n)
+               else Inl (mk_decode_error ExpectedPredicate 0)
+           | [] -> Inl (mk_decode_error ExpectedPredicate 0))
+      | Inl e -> Inl e)
+    (text_chars_enc is_scheme_char)
+    (fun (s: string) ->
+      let cs = FStar.String.list_of_string s in
+      (match cs with
+       | c :: _ -> text_chars_wfcv 64 is_scheme_char s && is_scheme_head c
+       | [] -> false))
+    (fun (s: string) -> True)
+    (text_chars_rest_cond 64 is_scheme_char)
+    (fun (s: string) (r: byte_seq) ->
+      let cs = FStar.String.list_of_string s in
+      (match cs with
+       | c :: _ ->
+           assert (is_scheme_head c);
+           assert (text_chars_wfcv 64 is_scheme_char s);
+           assert (True);
+           assert (text_chars_rest_cond 64 is_scheme_char s r);
+           lemma_text_chars_roundtrip 64 is_scheme_char s r;
+           assert (text_chars_dec 64 is_scheme_char (text_chars_enc is_scheme_char s `Seq.append` r)
+                     == Inr (s, Seq.length (text_chars_enc is_scheme_char s)));
+           Seq.lemma_index_app1 (text_chars_enc is_scheme_char s) r 0;
+           ()
+       | [] -> ()))
+    (lemma_text_chars_dec_err_bound 64 is_scheme_char)
+    (lemma_text_chars_dec_consumed_bound 64 is_scheme_char)
 
 
 (* ========================================================================
@@ -236,12 +306,13 @@ let query_codec : codec query =
 
 
 (** [ipv6_host] — the bracketed IPv6-literal host (RFC 3986 §3.2.2 [IP-literal]).
-    The brackets are part of the [fstar-ip] [ipv6_codec]'s wire form. *)
+    The `[` `]` brackets ARE part of the wire form (added here via [between];
+    [fstar-ip]'s [ipv6_codec] is the bare colon-hex content). *)
 let ipv6_host : codec uri_host =
   map_
     (fun (ip: ipv6) -> Some (IPv6Host ip))
     (fun h -> match h with IPv6Host ip -> Some ip | _ -> None)
-    Network.IPv6.ipv6_codec
+    (between open_bracket close_bracket Network.IPv6.ipv6_codec)
 
 
 (** [ipv4_host] — the dotted-decimal IPv4 host. *)
@@ -263,14 +334,57 @@ let domain_host : codec uri_host =
     Network.DNS.domain_codec
 
 
-(** [host_codec] — the prefix-disjoint choice of the three host kinds.
+(** [is_open_bracket_byte b] — does byte [b] open an `[` IP-literal? *)
+let is_open_bracket_byte (b: byte) : bool = U8.v b = 0x5B
 
-    IPv6 (bracketed, starts `[`) is tried first, then IPv4 (starts a digit),
-    then the DNS domain (starts a letter or other registered-name byte).  The
-    [choice] combinator tags each arm with a [0x00]/[0x01] byte so the
-    backward map is unambiguous. *)
+
+(** [is_digit_byte b] — does byte [b] begin a dotted-decimal IPv4 address? *)
+let is_digit_byte (b: byte) : bool = is_digit b
+
+
+(** [is_slash_byte b] — the `/` (0x2F) delimiter byte (authority prefix). *)
+let is_slash_byte (b: byte) : bool = U8.v b = 0x2F
+
+
+(** [is_question_byte b] — the `?` (0x3F) delimiter byte (query prefix). *)
+let is_question_byte (b: byte) : bool = U8.v b = 0x3F
+
+
+(** [is_hash_byte b] — the `#` (0x23) delimiter byte (fragment prefix). *)
+let is_hash_byte (b: byte) : bool = U8.v b = 0x23
+
+
+(** [is_colon_byte b] — the `:` (0x3A) delimiter byte (port prefix). *)
+let is_colon_byte (b: byte) : bool = U8.v b = 0x3A
+
+
+(** [host_codec] — the prefix-disjoint choice of the three host kinds,
+    UNTAGGED: the leading byte disambiguates —
+
+      - `[` → bracketed IPv6 ([ipv6_host]), tried first;
+      - a digit → dotted-decimal IPv4 ([ipv4_host]);
+      - anything else → DNS registered name ([domain_host]).
+
+    All three are first-byte-disjoint (a `[` is never a digit and never a
+    registered-name byte), so the untagged [alt] combinator applies with no
+    tag byte on the wire. *)
 let host_codec : codec uri_host =
-  choice ipv6_host (choice ipv4_host domain_host)
+  map_
+    (fun (v: either uri_host uri_host) ->
+      match v with Inl h -> Some h | Inr h -> Some h)
+    (fun (h: uri_host) ->
+      match h with
+      | IPv6Host _ -> Some (Inl h)
+      | _ -> Some (Inr h))
+    (alt
+      ipv6_host
+      (map_
+        (fun (v: either uri_host uri_host) ->
+          match v with Inl h -> Some h | Inr h -> Some h)
+        (fun (h: uri_host) ->
+          match h with IPv4Host _ -> Some (Inl h) | _ -> Some (Inr h))
+        (alt ipv4_host domain_host is_digit_byte))
+      is_open_bracket_byte)
 
 
 (* ========================================================================
@@ -284,28 +398,28 @@ let host_codec : codec uri_host =
 let port_codec : codec int = digits_to_int 5 (fun v -> v <= 65535)
 
 
-(** [userinfo_codec] — the [userinfo] `@` run (RFC 3986 §3.2.1). *)
-let userinfo_codec : codec string = text_chars 1024 is_pchar
+(** [userinfo_codec] — the [userinfo] run (RFC 3986 §3.2.1: [unreserved] |
+    [pct-encoded] | [sub-delims] | `:` — NOTE `@` is EXCLUDED, it terminates
+    userinfo).  Reserved for the deferred userinfo component (see the
+    [authority] note). *)
+let is_userinfo_char (c: FStar.Char.char) : bool =
+  let v = code_of c in
+  is_unreserved c || is_sub_delim c || v = 0x3A
 
 
-(** [authority_codec] — [ [userinfo "@"] host [":" port] ] as a [codec
-    authority], with the two optional components wrapped in [optional]
-    (tagged [sum], so [None] is representable). *)
+let userinfo_codec : codec string = text_chars 1024 is_userinfo_char
+
+
+(** [authority_codec] — [ host [":" port] ] as a [codec authority] (no tag
+    bytes; the [port] optional is delimiter-prefixed via [opt_prefixed]). *)
 let authority_codec : codec authority =
-  let userinfo_part : codec (option string) =
-    optional (map_ (fun (u, _) -> Some u)
-                   (fun u -> Some (u, ()))
-                   (product userinfo_codec at_sign))
-  in
   let port_part : codec (option int) =
-    optional (map_ (fun (_, p) -> Some p)
-                   (fun p -> Some ((), p))
-                   (product colon port_codec))
+    opt_prefixed is_colon_byte colon port_codec
   in
   map_
-    (fun (ui, (h, p)) -> Some ({ userinfo = ui; host = h; port = p }))
-    (fun (a: authority) -> Some (a.userinfo, (a.host, a.port)))
-    (product userinfo_part (product host_codec port_part))
+    (fun (h, p) -> Some ({ host = h; port = p }))
+    (fun (a: authority) -> Some (a.host, a.port))
+    (product host_codec port_part)
 
 
 (* ========================================================================
@@ -317,33 +431,28 @@ let authority_codec : codec authority =
 
         scheme ":" [ "//" authority ] path [ "?" query ] [ "#" fragment ]
 
-    The scheme is followed by a colon; the authority (if present) by [//];
-    then the path, an optional query, and an optional fragment.  All optional
-    components use [optional] (tagged [sum]). *)
+    The scheme is followed by a colon (payload BEFORE delimiter); the
+    authority (if present) is prefixed by [//]; then the path, an optional
+    query ([?]…), and an optional fragment ([#]…).  The colon/`?`/`#`
+    delimiters follow their payload, matching RFC text order. *)
 let uri_codec : codec uri =
-  let scheme_part : codec (unit & string) =
-    product colon scheme_codec
+  let scheme_part : codec (string & unit) =
+    product scheme_codec colon
   in
   let authority_part : codec (option authority) =
-    optional (map_ (fun (_, (_, a)) -> Some a)
-                   (fun a -> Some ((), ((), a)))
-                   (product slash (product slash authority_codec)))
+    opt_prefixed is_slash_byte double_slash authority_codec
   in
   let query_part : codec (option query) =
-    optional (map_ (fun (_, q) -> Some q)
-                   (fun q -> Some ((), q))
-                   (product question query_codec))
+    opt_prefixed is_question_byte question query_codec
   in
   let fragment_part : codec (option string) =
-    optional (map_ (fun (_, f) -> Some f)
-                   (fun f -> Some ((), f))
-                   (product hash (text_chars 1024 is_query_char)))
+    opt_prefixed is_hash_byte hash (text_chars 1024 is_query_char)
   in
   map_
-    (fun ((_, s), (a, (p, (q, f)))) ->
+    (fun ((s, _), (a, (p, (q, f)))) ->
       Some ({ scheme = s; authority = a; path = p; query = q; fragment = f }))
     (fun (u: uri) ->
-      Some (((), u.scheme), (u.authority, (u.path, (u.query, u.fragment)))))
+      Some ((u.scheme, ()), (u.authority, (u.path, (u.query, u.fragment)))))
     (product scheme_part
       (product authority_part
         (product path_codec
@@ -453,9 +562,35 @@ let lemma_encode_uri_roundtrip (u: uri) : Lemma
     ()
 
 
-(** [lemma_scheme_nonempty] — a well-formed [uri] has a non-empty scheme
-    (the [text_chars] one-or-more guard). *)
+(** [scheme_head] — the first character of a [uri]'s scheme ([None] iff the
+    scheme is empty; [Some c] carries the ALPHA head when well-formed). *)
+let scheme_head (u: uri) : option FStar.Char.char =
+  match FStar.String.list_of_string u.scheme with
+  | c :: _ -> Some c
+  | [] -> None
+
+
+(** [lemma_scheme_nonempty] — a scheme that is well-formed for [scheme_codec]
+    is non-empty and starts with an ALPHA character (the RFC 3986 [scheme]
+    head rule).
+
+    The precondition is the DIRECT, dischargeable [scheme_codec.wfcv] (the
+    [custom] head guard = [text_chars_wfcv] non-empty one-or-more run
+    conjoined with [is_scheme_head]), NOT the opaque composed
+    [uri_codec.wfcv] — so the implication is genuinely derived, not skipped
+    through opacity (fstar-proofs §24/§26).  [uri_codec.wfcv u] implies this
+    precondition via the [map_]/[product] well-formedness conjuncts. *)
 let lemma_scheme_nonempty (u: uri) : Lemma
-  (requires uri_codec.wfcv u)
-  (ensures String.length u.scheme >= 1)
-  = ()
+  (requires scheme_codec.wfcv u.scheme)
+  (ensures
+    String.length u.scheme >= 1 /\
+    (match scheme_head u with Some c -> char_is_alpha c | None -> False))
+  =
+    let cs = FStar.String.list_of_string u.scheme in
+    match cs with
+    | c :: _ ->
+        assert (text_chars_wfcv 64 is_scheme_char u.scheme);
+        assert (is_scheme_head c);
+        assert (char_is_alpha c);
+        ()
+    | [] -> (assert (Cons? cs))
